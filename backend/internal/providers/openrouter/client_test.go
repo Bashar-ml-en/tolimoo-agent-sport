@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"newsroom/internal/domain"
@@ -41,6 +42,29 @@ func TestDraftUsesConfiguredModelAndValidatesJSON(t *testing.T) {
 	}
 	if output.Outcome != "nothing_new" {
 		t.Fatalf("output = %#v", output)
+	}
+}
+
+func TestDraftWithLanguageRequestsEnglishOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Messages) != 1 || !strings.Contains(body.Messages[0].Content, "English Facebook and X drafts") {
+			t.Fatalf("prompt does not request English output: %#v", body.Messages)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"stop","message":{"content":"{\"outcome\":\"nothing_new\",\"reason\":\"No evidence\",\"drafts\":[]}"}}]}`))
+	}))
+	defer server.Close()
+	client := New("test-key", "vendor/model", server.Client())
+	client.BaseURL = server.URL
+	if _, err := client.DraftWithLanguage(context.Background(), "en", "LaLiga news", nil, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -21,8 +21,8 @@ type Researcher interface {
 	Search(context.Context, string, int) ([]domain.SourceEvidence, error)
 }
 type Writer interface {
-	Assess(context.Context, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.Assessment, error)
-	Draft(context.Context, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.FinalOutput, error)
+	AssessWithLanguage(context.Context, string, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.Assessment, error)
+	DraftWithLanguage(context.Context, string, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.FinalOutput, error)
 }
 
 type Workflow struct {
@@ -36,7 +36,7 @@ type Result struct {
 	Sources    map[string]domain.SourceEvidence
 }
 
-func (w Workflow) Run(ctx context.Context, assignment string, history []domain.StoryHistory, previouslySeen map[string]bool) (Result, error) {
+func (w Workflow) Run(ctx context.Context, assignment, language string, history []domain.StoryHistory, previouslySeen map[string]bool) (Result, error) {
 	if w.Researcher == nil || w.Writer == nil {
 		return Result{}, fmt.Errorf("research providers are not configured")
 	}
@@ -48,7 +48,7 @@ func (w Workflow) Run(ctx context.Context, assignment string, history []domain.S
 		return Result{}, fmt.Errorf("initial research: %w", err)
 	}
 	sources = assignIDs(sources, nil, previouslySeen)
-	assessment, err := w.Writer.Assess(ctx, assignment, sources, history)
+	assessment, err := w.Writer.AssessWithLanguage(ctx, language, assignment, sources, history)
 	if err != nil {
 		return Result{}, fmt.Errorf("assess evidence: %w", err)
 	}
@@ -67,7 +67,7 @@ func (w Workflow) Run(ctx context.Context, assignment string, history []domain.S
 	if len(sources) == 0 {
 		return Result{NothingNew: true, Reason: "No source evidence was returned."}, nil
 	}
-	output, err := w.Writer.Draft(ctx, assignment, sources, history)
+	output, err := w.Writer.DraftWithLanguage(ctx, language, assignment, sources, history)
 	if err != nil {
 		return Result{}, fmt.Errorf("generate drafts: %w", err)
 	}

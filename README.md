@@ -55,23 +55,23 @@ Each run starts with a current UTC date and a seven-day recent-news window, is l
 
 ## Automatic research scheduling
 
-Set `AGENT_SCHEDULER_ENABLED=true` to enable automatic runs. The scheduler uses the existing single queue and respects each enabled agent's `research_interval_seconds`; it stores the next due time in SQLite, so restarts do not run every assignment immediately. A new enabled assignment is first scheduled one interval ahead, with a small stagger between assignments. Manual “Check now” runs remain available and reset that assignment's next automatic attempt after completion or failure. Active assignments and a full queue are skipped without creating another run.
+Set `AGENT_SCHEDULER_ENABLED=true` to enable automatic runs. The scheduler checks for due work once per minute, uses the existing single queue, and respects each enabled agent's `research_interval_seconds`; it stores the next due time in SQLite, so restarts do not run every assignment immediately. New reporters and fresh databases default to a 60-second interval; existing reporters retain their saved interval until updated. A new enabled assignment is first scheduled one interval ahead, with a small stagger between assignments. Manual “Check now” runs remain available and reset that assignment's next automatic attempt after completion or failure. Active assignments and a full queue are skipped without creating another run.
 
 Automatic research spends Exa and OpenRouter credits. Do not enable it for ordinary development.
 
-To make a live, credit-spending check of one agent, first stop the API and record its current settings. This example temporarily enables only `premier_league` with a two-minute interval, clears only its schedule state so its first automatic run is two minutes ahead, then restores the normal seeded settings:
+To make a live, credit-spending check of one agent, first stop the API and record its current settings. This example temporarily enables only `premier_league` with a one-minute interval, clears only its schedule state so its first automatic run is one minute ahead, then restores the seeded settings:
 
 ```sh
 cd backend
 sqlite3 data/newsroom.db "SELECT id, enabled, research_interval_seconds FROM agents ORDER BY id;"
-sqlite3 data/newsroom.db "UPDATE agents SET enabled=0; UPDATE agents SET enabled=1, research_interval_seconds=120 WHERE id='premier_league'; DELETE FROM agent_schedules WHERE agent_id='premier_league';"
+sqlite3 data/newsroom.db "UPDATE agents SET enabled=0; UPDATE agents SET enabled=1, research_interval_seconds=60 WHERE id='premier_league'; DELETE FROM agent_schedules WHERE agent_id='premier_league';"
 AGENT_SCHEDULER_ENABLED=true go run ./cmd/api
 
-# In another terminal, wait a little over two minutes, then inspect results:
+# In another terminal, wait a little over one minute, then inspect results:
 curl -sS http://localhost:8080/api/v1/agents/premier_league/messages
 
-# Stop the API, then restore the seeded enabled flags and normal 30-minute interval:
-sqlite3 data/newsroom.db "UPDATE agents SET enabled=1, research_interval_seconds=1800;"
+# Stop the API, then restore the seeded enabled flags and one-minute interval:
+sqlite3 data/newsroom.db "UPDATE agents SET enabled=1, research_interval_seconds=60;"
 ```
 
 If your database has customized enabled flags or intervals, restore the values recorded by the first command instead of the seeded defaults.

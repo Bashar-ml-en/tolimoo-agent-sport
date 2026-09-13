@@ -146,13 +146,13 @@ func (r repository) markFailed(runID string) error {
 	return tx.Commit()
 }
 
-func (r repository) assignment(agentID string) (string, error) {
-	var assignment string
-	err := r.db.QueryRow(`SELECT assignment FROM agents WHERE id=?`, agentID).Scan(&assignment)
+func (r repository) assignment(agentID string) (string, string, error) {
+	var assignment, language string
+	err := r.db.QueryRow(`SELECT assignment, language FROM agents WHERE id=?`, agentID).Scan(&assignment, &language)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", errUnknownAgent
+		return "", "", errUnknownAgent
 	}
-	return assignment, err
+	return assignment, language, err
 }
 
 func (r repository) historyAndURLs() ([]domain.StoryHistory, map[string]bool, error) {
@@ -351,14 +351,14 @@ func (q *runQueue) process(run runRecord) {
 	}
 	ctx, cancel := context.WithTimeout(q.ctx, q.timeout)
 	defer cancel()
-	assignment, err := q.repo.assignment(run.AgentID)
+	assignment, language, err := q.repo.assignment(run.AgentID)
 	if err == nil {
 		var history []domain.StoryHistory
 		var urls map[string]bool
 		history, urls, err = q.repo.historyAndURLs()
 		if err == nil {
 			var result agent.Result
-			result, err = q.workflow.Run(ctx, assignment, history, urls)
+			result, err = q.workflow.Run(ctx, assignment, language, history, urls)
 			if err == nil {
 				err = q.repo.completeRun(run, result)
 			}

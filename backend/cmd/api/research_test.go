@@ -36,10 +36,10 @@ type fakeWriter struct {
 	assessErr, draftErr error
 }
 
-func (f fakeWriter) Assess(context.Context, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.Assessment, error) {
+func (f fakeWriter) AssessWithLanguage(context.Context, string, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.Assessment, error) {
 	return f.assessment, f.assessErr
 }
-func (f fakeWriter) Draft(context.Context, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.FinalOutput, error) {
+func (f fakeWriter) DraftWithLanguage(context.Context, string, string, []domain.SourceEvidence, []domain.StoryHistory) (domain.FinalOutput, error) {
 	return f.output, f.draftErr
 }
 
@@ -109,7 +109,7 @@ func TestRunRequestWithoutCredentialsDoesNotCreateRun(t *testing.T) {
 
 func TestWorkflowRejectsInventedSourceID(t *testing.T) {
 	workflow := agent.Workflow{Researcher: fakeResearcher{sources: []domain.SourceEvidence{testSource()}}, Writer: fakeWriter{assessment: domain.Assessment{Outcome: "final"}, output: testDraft("invented_source")}}
-	_, err := workflow.Run(context.Background(), "Premier League news", nil, map[string]bool{})
+	_, err := workflow.Run(context.Background(), "Premier League news", "fr", nil, map[string]bool{})
 	if err == nil {
 		t.Fatal("expected unknown source ID to fail")
 	}
@@ -120,7 +120,7 @@ func TestWorkflowRejectsOfficialSourceOutsideDraftEvidence(t *testing.T) {
 		Researcher: fakeResearcher{sources: []domain.SourceEvidence{testSource(), {URL: "https://example.com/other", Title: "Other", RetrievedAt: time.Now().UTC(), Content: "Other evidence."}}},
 		Writer:     fakeWriter{assessment: domain.Assessment{Outcome: "final"}, output: domain.FinalOutput{Outcome: "drafts", Drafts: []domain.DraftCandidate{{Headline: "Titre", ClaimStatus: "official", FacebookText: "Texte Facebook", XText: "Texte X", SourceIDs: []string{"source_1"}, OfficialSourceIDs: []string{"source_2"}}}}},
 	}
-	if _, err := workflow.Run(context.Background(), "Premier League news", nil, map[string]bool{}); err == nil {
+	if _, err := workflow.Run(context.Background(), "Premier League news", "fr", nil, map[string]bool{}); err == nil {
 		t.Fatal("expected official source outside draft evidence to fail")
 	}
 }

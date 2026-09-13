@@ -240,6 +240,63 @@ func TestPatchDraft(t *testing.T) {
 	})
 }
 
+func TestPatchAgentUpdatesAssignmentAndConfiguration(t *testing.T) {
+	db := testDatabase(t)
+	handler := newAPI(db, nil, testLogger(), nil)
+	response := request(t, handler, http.MethodPatch, "/api/v1/agents/premier_league", `{"assignment":"LaLiga news","language":"en","enabled":false,"platforms":["x"],"researchIntervalSeconds":300}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Agent struct {
+			Assignment string   `json:"assignment"`
+			Language   string   `json:"language"`
+			Enabled    bool     `json:"enabled"`
+			Platforms  []string `json:"platforms"`
+			Interval   int      `json:"researchIntervalSeconds"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Agent.Assignment != "LaLiga news" || body.Agent.Language != "en" || body.Agent.Enabled || len(body.Agent.Platforms) != 1 || body.Agent.Platforms[0] != "x" || body.Agent.Interval != 300 {
+		t.Fatalf("unexpected agent update: %+v", body.Agent)
+	}
+	bad := request(t, handler, http.MethodPatch, "/api/v1/agents/premier_league", `{"researchIntervalSeconds":59}`)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("invalid interval status = %d", bad.Code)
+	}
+}
+
+func TestCreateAgent(t *testing.T) {
+	db := testDatabase(t)
+	handler := newAPI(db, nil, testLogger(), nil)
+	response := request(t, handler, http.MethodPost, "/api/v1/agents", `{"id":"laliga_reporter","assignment":"LaLiga news","enabled":true,"platforms":["facebook","x"],"researchIntervalSeconds":300}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Agent struct {
+			ID, Assignment string
+			Interval       int `json:"researchIntervalSeconds"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Agent.ID != "laliga_reporter" || body.Agent.Assignment != "LaLiga news" || body.Agent.Interval != 300 {
+		t.Fatalf("unexpected create response: %+v", body.Agent)
+	}
+	duplicate := request(t, handler, http.MethodPost, "/api/v1/agents", `{"id":"laliga_reporter","assignment":"Duplicate"}`)
+	if duplicate.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d", duplicate.Code)
+	}
+	invalid := request(t, handler, http.MethodPost, "/api/v1/agents", `{"id":"Not valid","assignment":"Test"}`)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status = %d", invalid.Code)
+	}
+}
+
 type patchedDraft struct {
 	ID           string                `json:"id"`
 	AgentID      string                `json:"agentId"`

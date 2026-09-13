@@ -15,13 +15,27 @@ Enums: run status `queued | running | completed | failed`; draft review status `
 `GET /api/v1/agents` → `200`
 
 ```json
-{"agents":[{"id":"premier_league","assignment":"Premier League news","language":"fr","platforms":["facebook","x"],"enabled":true,"researchIntervalSeconds":1800,"pendingDraftCount":0,"isRunning":false,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]}
+{"agents":[{"id":"premier_league","assignment":"Premier League news","language":"fr","platforms":["facebook","x"],"enabled":true,"researchIntervalSeconds":60,"pendingDraftCount":0,"isRunning":false,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]}
 ```
 
 `GET /api/v1/agents/{id}/messages` → `200`. A valid new conversation has no fabricated content and returns an empty list:
 
 ```json
 {"messages":[]}
+```
+
+`PATCH /api/v1/agents/{id}` updates an existing reporter's assignment and monitoring configuration without changing its ID, drafts, stories, or conversation history. It accepts any non-empty subset of:
+
+```json
+{"assignment":"LaLiga news","enabled":true,"platforms":["facebook","x"],"researchIntervalSeconds":60}
+```
+
+`assignment` must be nonblank, `language` supports `"fr"` (French) and `"en"` (English), platforms are unique values from `facebook | x`, and `researchIntervalSeconds` must be between 60 and 86400. The response is `{"agent":{...}}`. The language controls future model-generated drafts; existing saved drafts are unchanged. `enabled:false` pauses future automatic scheduling but does not cancel a run already in progress; manual research remains available.
+
+`POST /api/v1/agents` creates a reporter and returns `201`. New reporters are discovered by the enabled scheduler on its next tick; their first automatic run is one interval ahead. Required fields are `id` (3–64 lowercase letters, numbers, or underscores) and a nonblank `assignment`. Optional settings use the same validation as PATCH and default to `language:"fr"`, both platforms, enabled, and a 60-second interval. Existing reporters keep their stored interval until explicitly updated:
+
+```json
+{"id":"laliga_reporter","assignment":"LaLiga news","platforms":["facebook","x"],"enabled":true,"researchIntervalSeconds":60}
 ```
 
 If messages exist, the response is:

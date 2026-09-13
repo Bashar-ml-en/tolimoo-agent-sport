@@ -236,7 +236,7 @@ func seed(db *sql.DB) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	agents := []struct{ id, assignment string }{{"premier_league", "Premier League news"}, {"bundesliga", "Bundesliga transfers"}, {"coach_statements", "Coach statements"}}
 	for _, a := range agents {
-		_, err := db.Exec(`INSERT INTO agents (id, assignment, language, platforms, enabled, research_interval_seconds, created_at, updated_at) VALUES (?, ?, 'fr', '["facebook","x"]', 1, 1800, ?, ?) ON CONFLICT(id) DO NOTHING`, a.id, a.assignment, now, now)
+		_, err := db.Exec(`INSERT INTO agents (id, assignment, language, platforms, enabled, research_interval_seconds, created_at, updated_at) VALUES (?, ?, 'fr', '["facebook","x"]', 1, 60, ?, ?) ON CONFLICT(id) DO NOTHING`, a.id, a.assignment, now, now)
 		if err != nil {
 			return err
 		}
@@ -449,6 +449,10 @@ func (a *api) applyDraftPatch(draftID string, patch draftPatch) (bool, error) {
 	return true, nil
 }
 func (a *api) agents(w http.ResponseWriter, r *http.Request, rest []string) {
+	if len(rest) == 0 && r.Method == "POST" {
+		a.createAgent(w, r)
+		return
+	}
 	if len(rest) == 0 && r.Method == "GET" {
 		rows, err := a.db.Query(`SELECT a.id, a.assignment, a.language, a.platforms, a.enabled, a.research_interval_seconds, a.created_at, a.updated_at,
 			(SELECT COUNT(*) FROM drafts d WHERE d.agent_id = a.id AND d.review_status = 'pending'),
@@ -478,6 +482,10 @@ func (a *api) agents(w http.ResponseWriter, r *http.Request, rest []string) {
 		jsonResponse(w, 200, map[string]any{"agents": result})
 		return
 	}
+	if len(rest) == 1 && r.Method == "PATCH" {
+		a.patchAgent(w, r, rest[0])
+		return
+	}
 	if len(rest) == 2 && rest[1] == "messages" && r.Method == "GET" {
 		a.messages(w, rest[0])
 		return
@@ -491,6 +499,207 @@ func (a *api) agents(w http.ResponseWriter, r *http.Request, rest []string) {
 		return
 	}
 	jsonError(w, 404, "not_found", "Route not found.")
+}
+
+func (a *api) createAgent(w http.ResponseWriter, r *http.Request) {
+	var raw map[string]json.RawMessage
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&raw); err != nil || ensureEOF(decoder) != nil {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "Request body must contain one JSON object.")
+		return
+	}
+	allowed := map[string]bool{"id": true, "assignment": true, "language": true, "platforms": true, "enabled": true, "researchIntervalSeconds": true}
+	for field := range raw {
+		if !allowed[field] {
+			jsonError(w, http.StatusBadRequest, "invalid_request", "Unknown field \""+field+"\".")
+			return
+		}
+	}
+	var id, assignment, language string
+	var platforms []string
+	enabled, interval := true, 60
+	if value, ok := raw["id"]; !ok || json.Unmarshal(value, &id) != nil || !validAgentID(id) {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "id must contain lowercase letters, numbers, and underscores only.")
+		return
+	}
+	if value, ok := raw["assignment"]; !ok || json.Unmarshal(value, &assignment) != nil || strings.TrimSpace(assignment) == "" || len(assignment) > 300 {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "assignment must be a nonblank string up to 300 characters.")
+		return
+	}
+	language = "fr"
+	if value, ok := raw["language"]; ok && (json.Unmarshal(value, &language) != nil || !validLanguage(language)) {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "language must be a supported value: fr or en.")
+		return
+	}
+	platforms = []string{"facebook", "x"}
+	if value, ok := raw["platforms"]; ok && json.Unmarshal(value, &platforms) != nil {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "platforms must be an array.")
+		return
+	}
+	if !validPlatforms(platforms) {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "platforms must contain unique facebook and/or x values.")
+		return
+	}
+	if value, ok := raw["enabled"]; ok && (string(value) == "null" || json.Unmarshal(value, &enabled) != nil) {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "enabled must be a boolean.")
+		return
+	}
+	if value, ok := raw["researchIntervalSeconds"]; ok && (json.Unmarshal(value, &interval) != nil || interval < 60 || interval > 86400) {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "researchIntervalSeconds must be between 60 and 86400.")
+		return
+	}
+	encoded, _ := json.Marshal(platforms)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	flag := 0
+	if enabled {
+		flag = 1
+	}
+	_, err := a.db.Exec(`INSERT INTO agents (id,assignment,language,platforms,enabled,research_interval_seconds,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`, id, strings.TrimSpace(assignment), language, string(encoded), flag, interval, now, now)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			jsonError(w, http.StatusConflict, "conflict", "An agent with this id already exists.")
+			return
+		}
+		a.log.Error("create agent", "error", err)
+		jsonError(w, http.StatusInternalServerError, "database_error", "Could not create agent.")
+		return
+	}
+	jsonResponse(w, http.StatusCreated, map[string]any{"agent": map[string]any{"id": id, "assignment": strings.TrimSpace(assignment), "language": language, "platforms": platforms, "enabled": enabled, "researchIntervalSeconds": interval, "pendingDraftCount": 0, "isRunning": false, "createdAt": now, "updatedAt": now}})
+}
+
+func validAgentID(value string) bool {
+	if len(value) < 3 || len(value) > 64 {
+		return false
+	}
+	for _, char := range value {
+		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '_') {
+			return false
+		}
+	}
+	return true
+}
+func validPlatforms(platforms []string) bool {
+	if len(platforms) == 0 || len(platforms) > 2 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, platform := range platforms {
+		if (platform != "facebook" && platform != "x") || seen[platform] {
+			return false
+		}
+		seen[platform] = true
+	}
+	return true
+}
+
+func validLanguage(language string) bool {
+	return language == "fr" || language == "en"
+}
+
+type agentPatch struct {
+	assignment, language, platforms, interval *json.RawMessage
+	enabled                                   *json.RawMessage
+}
+
+func (a *api) patchAgent(w http.ResponseWriter, r *http.Request, rawID string) {
+	agentID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(agentID) == "" {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "Invalid agent identifier.")
+		return
+	}
+	var raw map[string]json.RawMessage
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&raw); err != nil || len(raw) == 0 || ensureEOF(decoder) != nil {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "Request body must contain one non-empty JSON object.")
+		return
+	}
+	patch := agentPatch{}
+	for field, value := range raw {
+		fieldValue := value
+		switch field {
+		case "assignment":
+			patch.assignment = &fieldValue
+		case "language":
+			patch.language = &fieldValue
+		case "platforms":
+			patch.platforms = &fieldValue
+		case "enabled":
+			patch.enabled = &fieldValue
+		case "researchIntervalSeconds":
+			patch.interval = &fieldValue
+		default:
+			jsonError(w, http.StatusBadRequest, "invalid_request", "Unknown field \""+field+"\".")
+			return
+		}
+	}
+	updated, err := a.applyAgentPatch(agentID, patch)
+	if errors.Is(err, sql.ErrNoRows) {
+		jsonError(w, http.StatusNotFound, "not_found", "Agent not found.")
+		return
+	}
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"agent": updated})
+}
+
+func (a *api) applyAgentPatch(agentID string, patch agentPatch) (map[string]any, error) {
+	var assignment, language, platforms, createdAt string
+	var enabled, interval int
+	err := a.db.QueryRow(`SELECT assignment,language,platforms,enabled,research_interval_seconds,created_at FROM agents WHERE id=?`, agentID).Scan(&assignment, &language, &platforms, &enabled, &interval, &createdAt)
+	if err != nil {
+		return nil, err
+	}
+	if patch.assignment != nil {
+		if err := json.Unmarshal(*patch.assignment, &assignment); err != nil || strings.TrimSpace(assignment) == "" || len(assignment) > 300 {
+			return nil, fmt.Errorf("assignment must be a nonblank string up to 300 characters")
+		}
+	}
+	if patch.language != nil {
+		if err := json.Unmarshal(*patch.language, &language); err != nil || !validLanguage(language) {
+			return nil, fmt.Errorf("language must be a supported value: fr or en")
+		}
+	}
+	var platformList []string
+	if err := json.Unmarshal([]byte(platforms), &platformList); err != nil {
+		return nil, err
+	}
+	if patch.platforms != nil {
+		if err := json.Unmarshal(*patch.platforms, &platformList); err != nil || len(platformList) == 0 || len(platformList) > 2 {
+			return nil, fmt.Errorf("platforms must be a non-empty array containing facebook and/or x")
+		}
+		seen := map[string]bool{}
+		for _, platform := range platformList {
+			if (platform != "facebook" && platform != "x") || seen[platform] {
+				return nil, fmt.Errorf("platforms must contain unique facebook and/or x values")
+			}
+			seen[platform] = true
+		}
+		encoded, _ := json.Marshal(platformList)
+		platforms = string(encoded)
+	}
+	if patch.enabled != nil {
+		var value bool
+		if string(*patch.enabled) == "null" || json.Unmarshal(*patch.enabled, &value) != nil {
+			return nil, fmt.Errorf("enabled must be a boolean")
+		}
+		if value {
+			enabled = 1
+		} else {
+			enabled = 0
+		}
+	}
+	if patch.interval != nil {
+		if err := json.Unmarshal(*patch.interval, &interval); err != nil || interval < 60 || interval > 86400 {
+			return nil, fmt.Errorf("researchIntervalSeconds must be between 60 and 86400")
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := a.db.Exec(`UPDATE agents SET assignment=?,language=?,platforms=?,enabled=?,research_interval_seconds=?,updated_at=? WHERE id=?`, assignment, language, string(platforms), enabled, interval, now, agentID); err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": agentID, "assignment": assignment, "language": language, "platforms": platformList, "enabled": enabled == 1, "researchIntervalSeconds": interval, "createdAt": createdAt, "updatedAt": now}, nil
 }
 func (a *api) startRun(w http.ResponseWriter, agentID string) {
 	decodedID, err := url.PathUnescape(agentID)
