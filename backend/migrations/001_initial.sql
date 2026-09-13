@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, assignment TEXT NOT NULL, language TEXT NOT NULL, platforms TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, research_interval_seconds INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), status TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT);
+CREATE TABLE IF NOT EXISTS stories (id TEXT PRIMARY KEY, deduplication_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, summary TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, story_id TEXT NOT NULL REFERENCES stories(id), url TEXT NOT NULL, title TEXT NOT NULL, published_at TEXT, retrieved_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), story_id TEXT NOT NULL REFERENCES stories(id), run_id TEXT NOT NULL REFERENCES runs(id), headline TEXT NOT NULL, claim_status TEXT NOT NULL, facebook_text TEXT NOT NULL, x_text TEXT NOT NULL, review_status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), role TEXT NOT NULL, message_type TEXT NOT NULL, text TEXT NOT NULL, draft_id TEXT REFERENCES drafts(id), run_id TEXT REFERENCES runs(id), created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_messages_agent_created ON messages(agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_runs_agent_status ON runs(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_drafts_agent_review ON drafts(agent_id, review_status);
+CREATE INDEX IF NOT EXISTS idx_sources_story ON sources(story_id);

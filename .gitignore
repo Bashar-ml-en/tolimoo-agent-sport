@@ -1,0 +1,6 @@
+backend/data/
+backend/*.db
+mobile/node_modules/
+.env
+.env.local
+.DS_Store
