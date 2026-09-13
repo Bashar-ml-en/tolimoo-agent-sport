@@ -6,21 +6,33 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
+	"newsroom/internal/agent"
+	"newsroom/internal/providers/exa"
+	"newsroom/internal/providers/openrouter"
+	"newsroom/migrations"
 )
 
 type config struct {
-	addr, dbPath string
-	cors         []string
+	appEnv, addr, dbPath                         string
+	cors                                         []string
+	exaAPIKey, openRouterAPIKey, openRouterModel string
+	schedulerEnabled                             bool
+	runTimeout                                   time.Duration
+	queueCapacity                                int
 }
 
 func env(key, fallback string) string {
@@ -30,25 +42,52 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+func loadConfig() (config, error) {
+	schedulerEnabled, err := strconv.ParseBool(env("AGENT_SCHEDULER_ENABLED", "false"))
+	if err != nil {
+		return config{}, fmt.Errorf("AGENT_SCHEDULER_ENABLED must be true or false: %w", err)
+	}
+	runTimeout, err := time.ParseDuration(env("AGENT_RUN_TIMEOUT", "2m"))
+	if err != nil || runTimeout <= 0 {
+		return config{}, fmt.Errorf("AGENT_RUN_TIMEOUT must be a positive duration")
+	}
+	queueCapacity, err := strconv.Atoi(env("AGENT_QUEUE_CAPACITY", "8"))
+	if err != nil || queueCapacity < 1 {
+		return config{}, fmt.Errorf("AGENT_QUEUE_CAPACITY must be a positive integer")
+	}
+	origins := strings.Split(env("CORS_ALLOWED_ORIGINS", "http://localhost:8081,http://localhost:19006"), ",")
+	return config{
+		appEnv:           env("APP_ENV", "development"),
+		addr:             env("HTTP_ADDR", ":8080"),
+		dbPath:           env("DATABASE_PATH", "./data/newsroom.db"),
+		cors:             origins,
+		exaAPIKey:        os.Getenv("EXA_API_KEY"),
+		openRouterAPIKey: os.Getenv("OPENROUTER_API_KEY"),
+		openRouterModel:  os.Getenv("OPENROUTER_MODEL"),
+		schedulerEnabled: schedulerEnabled,
+		runTimeout:       runTimeout,
+		queueCapacity:    queueCapacity,
+	}, nil
+}
+
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	cfg := config{env("HTTP_ADDR", ":8080"), env("DATABASE_PATH", "./data/newsroom.db"), strings.Split(env("CORS_ALLOWED_ORIGINS", "http://localhost:8081,http://localhost:19006"), ",")}
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Error("load configuration", "error", err)
+		os.Exit(1)
+	}
+	log.Info("configuration loaded", "environment", cfg.appEnv, "scheduler_enabled", cfg.schedulerEnabled)
 	if err := os.MkdirAll(filepath.Dir(cfg.dbPath), 0o755); err != nil {
 		log.Error("create database directory", "error", err)
 		os.Exit(1)
 	}
-	db, err := sql.Open("sqlite", cfg.dbPath+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)")
+	db, err := openDatabase(cfg.dbPath)
 	if err != nil {
 		log.Error("open database", "error", err)
 		os.Exit(1)
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	if err := db.Ping(); err != nil {
-		log.Error("connect database", "error", err)
-		os.Exit(1)
-	}
 	if err := migrate(db); err != nil {
 		log.Error("migrate database", "error", err)
 		os.Exit(1)
@@ -57,13 +96,21 @@ func main() {
 		log.Error("seed database", "error", err)
 		os.Exit(1)
 	}
-
-	h := newAPI(db, cfg.cors, log)
-	server := &http.Server{Addr: cfg.addr, Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	repo := repository{db: db}
+	if err := repo.recoverInterruptedRuns(); err != nil {
+		log.Error("recover interrupted runs", "error", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go func() { log.Info("API listening", "addr", cfg.addr) }()
+	configured := cfg.exaAPIKey != "" && cfg.openRouterAPIKey != "" && cfg.openRouterModel != ""
+	workflow := agent.Workflow{Researcher: exa.New(cfg.exaAPIKey, nil), Writer: openrouter.New(cfg.openRouterAPIKey, cfg.openRouterModel, nil)}
+	queue := newRunQueue(ctx, repo, workflow, cfg.runTimeout, cfg.queueCapacity, configured, log)
+
+	h := newAPI(db, cfg.cors, log, queue)
+	server := &http.Server{Addr: cfg.addr, Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	go func() {
+		log.Info("API listening", "addr", cfg.addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server stopped", "error", err)
 			os.Exit(1)
@@ -72,7 +119,24 @@ func main() {
 	<-ctx.Done()
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	queue.stop(shutdown)
 	_ = server.Shutdown(shutdown)
+}
+
+func openDatabase(path string) (*sql.DB, error) {
+	// MaxOpenConns=1 makes the single-process connection strategy explicit. The
+	// DSN pragmas are then applied to the only connection used by this process.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func jsonError(w http.ResponseWriter, status int, code, message string) {
@@ -88,28 +152,52 @@ func jsonResponse(w http.ResponseWriter, status int, value any) {
 func notImplemented(w http.ResponseWriter) {
 	jsonError(w, http.StatusNotImplemented, "not_implemented", "This operation is not implemented yet.")
 }
-func boundedJSON(r *http.Request, dst any) error {
-	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20)
-	return json.NewDecoder(r.Body).Decode(dst)
-}
 
-// migrate is intentionally small and repeatable: each numbered SQL file is recorded once.
+// migrate applies each numbered SQL file once and records its version. Existing
+// databases from the first scaffold are safe because the SQL is idempotent.
 func migrate(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`)
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(schema)
-	return err
+	entries, err := migrations.FS.ReadDir(".")
+	if err != nil {
+		return fmt.Errorf("read migrations: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		var applied int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, entry.Name()).Scan(&applied); err != nil {
+			return err
+		}
+		if applied > 0 {
+			continue
+		}
+		sqlBytes, err := migrations.FS.ReadFile(entry.Name())
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", entry.Name(), err)
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", entry.Name(), err)
+		}
+		if _, err := tx.Exec(string(sqlBytes)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("apply migration %s: %w", entry.Name(), err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, entry.Name(), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", entry.Name(), err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
 }
-
-const schema = `CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, assignment TEXT NOT NULL, language TEXT NOT NULL, platforms TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, research_interval_seconds INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), status TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT);
-CREATE TABLE IF NOT EXISTS stories (id TEXT PRIMARY KEY, deduplication_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, summary TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, story_id TEXT NOT NULL REFERENCES stories(id), url TEXT NOT NULL, title TEXT NOT NULL, published_at TEXT, retrieved_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), story_id TEXT NOT NULL REFERENCES stories(id), run_id TEXT NOT NULL REFERENCES runs(id), headline TEXT NOT NULL, claim_status TEXT NOT NULL, facebook_text TEXT NOT NULL, x_text TEXT NOT NULL, review_status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), role TEXT NOT NULL, message_type TEXT NOT NULL, text TEXT NOT NULL, draft_id TEXT REFERENCES drafts(id), run_id TEXT REFERENCES runs(id), created_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_messages_agent_created ON messages(agent_id, created_at); CREATE INDEX IF NOT EXISTS idx_runs_agent_status ON runs(agent_id, status); CREATE INDEX IF NOT EXISTS idx_drafts_agent_review ON drafts(agent_id, review_status); CREATE INDEX IF NOT EXISTS idx_sources_story ON sources(story_id);`
 
 func seed(db *sql.DB) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -124,21 +212,23 @@ func seed(db *sql.DB) error {
 }
 
 type api struct {
-	db   *sql.DB
-	cors map[string]bool
-	log  *slog.Logger
+	db    *sql.DB
+	cors  map[string]bool
+	log   *slog.Logger
+	queue *runQueue
 }
 
-func newAPI(db *sql.DB, origins []string, log *slog.Logger) http.Handler {
+func newAPI(db *sql.DB, origins []string, log *slog.Logger, queue *runQueue) http.Handler {
 	cors := map[string]bool{}
 	for _, origin := range origins {
 		cors[strings.TrimSpace(origin)] = true
 	}
-	a := &api{db: db, cors: cors, log: log}
+	a := &api{db: db, cors: cors, log: log, queue: queue}
 	return a.middleware(http.HandlerFunc(a.route))
 }
 func (a *api) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		origin := r.Header.Get("Origin")
 		if a.cors[origin] {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -180,7 +270,10 @@ func (a *api) route(w http.ResponseWriter, r *http.Request) {
 }
 func (a *api) agents(w http.ResponseWriter, r *http.Request, rest []string) {
 	if len(rest) == 0 && r.Method == "GET" {
-		rows, err := a.db.Query(`SELECT id, assignment, language, platforms, enabled, research_interval_seconds, created_at, updated_at FROM agents ORDER BY id`)
+		rows, err := a.db.Query(`SELECT a.id, a.assignment, a.language, a.platforms, a.enabled, a.research_interval_seconds, a.created_at, a.updated_at,
+			(SELECT COUNT(*) FROM drafts d WHERE d.agent_id = a.id AND d.review_status = 'pending'),
+			(SELECT COUNT(*) FROM runs r WHERE r.agent_id = a.id AND r.status IN ('queued', 'running'))
+			FROM agents a ORDER BY a.id`)
 		if err != nil {
 			jsonError(w, 500, "database_error", "Could not list agents.")
 			return
@@ -189,17 +282,18 @@ func (a *api) agents(w http.ResponseWriter, r *http.Request, rest []string) {
 		result := []map[string]any{}
 		for rows.Next() {
 			var id, assignment, language, platforms, created, updated string
-			var enabled, interval int
-			if err := rows.Scan(&id, &assignment, &language, &platforms, &enabled, &interval, &created, &updated); err != nil {
+			var enabled, interval, pending, running int
+			if err := rows.Scan(&id, &assignment, &language, &platforms, &enabled, &interval, &created, &updated, &pending, &running); err != nil {
 				jsonError(w, 500, "database_error", "Could not read agents.")
 				return
 			}
 			var platformList []string
 			_ = json.Unmarshal([]byte(platforms), &platformList)
-			var pending, running int
-			_ = a.db.QueryRow(`SELECT COUNT(*) FROM drafts WHERE agent_id=? AND review_status='pending'`, id).Scan(&pending)
-			_ = a.db.QueryRow(`SELECT COUNT(*) FROM runs WHERE agent_id=? AND status IN ('queued','running')`, id).Scan(&running)
 			result = append(result, map[string]any{"id": id, "assignment": assignment, "language": language, "platforms": platformList, "enabled": enabled == 1, "researchIntervalSeconds": interval, "pendingDraftCount": pending, "isRunning": running > 0, "createdAt": created, "updatedAt": updated})
+		}
+		if err := rows.Err(); err != nil {
+			jsonError(w, 500, "database_error", "Could not read agents.")
+			return
 		}
 		jsonResponse(w, 200, map[string]any{"agents": result})
 		return
@@ -208,14 +302,69 @@ func (a *api) agents(w http.ResponseWriter, r *http.Request, rest []string) {
 		a.messages(w, rest[0])
 		return
 	}
-	if len(rest) == 2 && rest[1] == "runs" && r.Method == "POST" {
+	if len(rest) == 2 && rest[1] == "messages" && r.Method == "POST" {
 		notImplemented(w)
+		return
+	}
+	if len(rest) == 2 && rest[1] == "runs" && r.Method == "POST" {
+		a.startRun(w, rest[0])
 		return
 	}
 	jsonError(w, 404, "not_found", "Route not found.")
 }
+func (a *api) startRun(w http.ResponseWriter, agentID string) {
+	decodedID, err := url.PathUnescape(agentID)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "Invalid agent identifier.")
+		return
+	}
+	var exists int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM agents WHERE id = ?`, decodedID).Scan(&exists); err != nil {
+		jsonError(w, http.StatusInternalServerError, "database_error", "Could not find agent.")
+		return
+	}
+	if exists == 0 {
+		jsonError(w, http.StatusNotFound, "not_found", "Agent not found.")
+		return
+	}
+	if a.queue == nil {
+		jsonError(w, http.StatusServiceUnavailable, "configuration_error", "Research providers are not configured.")
+		return
+	}
+	run, err := a.queue.enqueue(decodedID)
+	switch {
+	case err == nil:
+		jsonResponse(w, http.StatusAccepted, map[string]any{"run": map[string]any{"id": run.ID, "agentId": run.AgentID, "status": run.Status, "startedAt": run.StartedAt, "endedAt": nil, "error": nil}})
+	case errors.Is(err, errUnknownAgent):
+		jsonError(w, http.StatusNotFound, "not_found", "Agent not found.")
+	case errors.Is(err, errActiveRun):
+		jsonError(w, http.StatusConflict, "conflict", "This agent already has an active run.")
+	case errors.Is(err, errQueueFull):
+		jsonError(w, http.StatusServiceUnavailable, "queue_full", "Research queue is full. Try again shortly.")
+	case errors.Is(err, errNotConfigured):
+		jsonError(w, http.StatusServiceUnavailable, "configuration_error", "Research requires EXA_API_KEY, OPENROUTER_API_KEY, and OPENROUTER_MODEL.")
+	default:
+		a.log.Error("queue research run", "error", err)
+		jsonError(w, http.StatusInternalServerError, "database_error", "Could not create research run.")
+	}
+}
 func (a *api) messages(w http.ResponseWriter, agentID string) {
-	rows, err := a.db.Query(`SELECT id, role, message_type, text, draft_id, run_id, created_at FROM messages WHERE agent_id=? ORDER BY created_at ASC, id ASC`, agentID)
+	decodedID, err := url.PathUnescape(agentID)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "Invalid agent identifier.")
+		return
+	}
+	var exists int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM agents WHERE id = ?`, decodedID).Scan(&exists); err != nil {
+		jsonError(w, http.StatusInternalServerError, "database_error", "Could not find agent.")
+		return
+	}
+	if exists == 0 {
+		jsonError(w, http.StatusNotFound, "not_found", "Agent not found.")
+		return
+	}
+
+	rows, err := a.db.Query(`SELECT id, role, message_type, text, draft_id, run_id, created_at FROM messages WHERE agent_id=? ORDER BY created_at ASC, id ASC`, decodedID)
 	if err != nil {
 		jsonError(w, 500, "database_error", "Could not read messages.")
 		return
@@ -229,7 +378,7 @@ func (a *api) messages(w http.ResponseWriter, agentID string) {
 			jsonError(w, 500, "database_error", "Could not read messages.")
 			return
 		}
-		item := map[string]any{"id": id, "agentId": agentID, "role": role, "messageType": typ, "text": text, "draftId": nil, "runId": nil, "createdAt": created}
+		item := map[string]any{"id": id, "agentId": decodedID, "role": role, "messageType": typ, "text": text, "draftId": nil, "runId": nil, "createdAt": created}
 		if draft.Valid {
 			item["draftId"] = draft.String
 		}
@@ -238,5 +387,55 @@ func (a *api) messages(w http.ResponseWriter, agentID string) {
 		}
 		items = append(items, item)
 	}
+	if err := rows.Err(); err != nil {
+		jsonError(w, 500, "database_error", "Could not read messages.")
+		return
+	}
+	if err := rows.Close(); err != nil {
+		jsonError(w, 500, "database_error", "Could not read messages.")
+		return
+	}
+	for _, item := range items {
+		draftID, ok := item["draftId"].(string)
+		if !ok {
+			continue
+		}
+		draft, err := a.draftPayload(draftID)
+		if err != nil {
+			jsonError(w, 500, "database_error", "Could not read draft.")
+			return
+		}
+		item["draft"] = draft
+	}
 	jsonResponse(w, 200, map[string]any{"messages": items})
+}
+
+func (a *api) draftPayload(draftID string) (map[string]any, error) {
+	var id, agentID, storyID, runID, headline, claimStatus, facebookText, xText, reviewStatus, createdAt, updatedAt string
+	err := a.db.QueryRow(`SELECT id, agent_id, story_id, run_id, headline, claim_status, facebook_text, x_text, review_status, created_at, updated_at FROM drafts WHERE id=?`, draftID).Scan(&id, &agentID, &storyID, &runID, &headline, &claimStatus, &facebookText, &xText, &reviewStatus, &createdAt, &updatedAt)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := a.db.Query(`SELECT id, url, title, published_at, retrieved_at FROM sources WHERE story_id=? ORDER BY id`, storyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sources := []map[string]any{}
+	for rows.Next() {
+		var sourceID, sourceURL, sourceTitle, retrievedAt string
+		var publishedAt sql.NullString
+		if err := rows.Scan(&sourceID, &sourceURL, &sourceTitle, &publishedAt, &retrievedAt); err != nil {
+			return nil, err
+		}
+		source := map[string]any{"id": sourceID, "url": sourceURL, "title": sourceTitle, "publishedAt": nil, "retrievedAt": retrievedAt}
+		if publishedAt.Valid {
+			source["publishedAt"] = publishedAt.String
+		}
+		sources = append(sources, source)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": id, "agentId": agentID, "storyId": storyID, "runId": runID, "headline": headline, "claimStatus": claimStatus, "facebookText": facebookText, "xText": xText, "reviewStatus": reviewStatus, "sources": sources, "createdAt": createdAt, "updatedAt": updatedAt}, nil
 }

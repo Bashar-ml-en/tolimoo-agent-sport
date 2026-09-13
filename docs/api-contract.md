@@ -18,17 +18,39 @@ Enums: run status `queued | running | completed | failed`; draft review status `
 {"agents":[{"id":"premier_league","assignment":"Premier League news","language":"fr","platforms":["facebook","x"],"enabled":true,"researchIntervalSeconds":1800,"pendingDraftCount":0,"isRunning":false,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]}
 ```
 
-`GET /api/v1/agents/{id}/messages` → `200`
+`GET /api/v1/agents/{id}/messages` → `200`. A valid new conversation has no fabricated content and returns an empty list:
+
+```json
+{"messages":[]}
+```
+
+If messages exist, the response is:
 
 ```json
 {"messages":[{"id":"message-1","agentId":"premier_league","role":"assistant","messageType":"draft","text":"Texte…","draftId":"draft-1","runId":null,"createdAt":"2026-01-01T00:00:00Z"}]}
 ```
 
-Nullable fields are emitted as JSON `null`; draft and source objects use the exact TypeScript fields in `mobile/src/types/api.ts`. Sources have `id`, `url`, `title`, nullable `publishedAt`, and `retrievedAt`.
+For a persisted draft message, an additive `draft` object is included with `id`, `agentId`, `storyId`, `runId`, `headline`, `claimStatus`, `facebookText`, `xText`, `reviewStatus`, `sources`, `createdAt`, and `updatedAt`. Sources have `id`, `url`, `title`, nullable `publishedAt`, and `retrievedAt`. Nullable fields are emitted as JSON `null`.
+
+An unknown agent returns `404`:
+
+```json
+{"error":{"code":"not_found","message":"Agent not found."}}
+```
+
+## Manual research run
+
+`POST /api/v1/agents/{id}/runs` accepts an empty JSON body (or no body) and returns `202` after persisting a queued run:
+
+```json
+{"run":{"id":"run_abc123","agentId":"premier_league","status":"queued","startedAt":"2026-01-01T00:00:00Z","endedAt":null,"error":null}}
+```
+
+Only one queued or running run is allowed per agent. An active assignment returns `409` with `code: "conflict"`. If credentials are missing, no run is created and the response is `503` with `code: "configuration_error"`. A full bounded queue returns `503` with `code: "queue_full"`. The frontend should poll agent list state and `GET /agents/{id}/messages`; successful nothing-new runs append a concise assistant status message and create no draft.
 
 ## Deferred mutations
 
-`POST /api/v1/agents/{id}/runs`, `POST /api/v1/agents/{id}/messages`, and `PATCH /api/v1/drafts/{id}` currently return `501`:
+`POST /api/v1/agents/{id}/messages` and `PATCH /api/v1/drafts/{id}` currently return `501`:
 
 ```json
 {"error":{"code":"not_implemented","message":"This operation is not implemented yet."}}

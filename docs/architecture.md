@@ -6,4 +6,8 @@ Planned workflow: scheduler queues an assignment run → Exa researches developm
 
 Stories are shared across agents so repeated findings can be deduplicated. Drafts belong to an agent and run; messages belong to an agent conversation (one conversation per agent for this MVP).
 
-Implemented now: schema bootstrap, seed data, health, agent listing with derived pending/running state, conversation reading, request logging/recovery, CORS, timeouts, body limit, graceful shutdown, and mobile screens with loading/empty/error states. Planned: real migration file execution, scheduler execution, Exa/OpenRouter clients, run/message/draft mutations, and publishing integrations.
+Implemented now: numbered SQL migration file execution with a repeatable migration ledger, seed data, health, agent listing with derived pending/running state, conversation reading, unknown-agent errors, request logging/recovery, CORS, timeouts, body limit, graceful shutdown, and a manual one-worker research queue. The queue persists queued runs before returning, recovers interrupted runs on restart, and atomically prevents more than one active run per agent.
+
+The manual workflow uses at most two Exa searches (five results each), asks OpenRouter first to assess evidence and optionally request one follow-up search, then requests final structured French drafts. Source text is bounded and treated as untrusted data. The model can only cite backend-assigned source IDs, which are validated before persistence. Final stories, sources, drafts, messages, and the completed run state are saved in one transaction. Exact normalized source URLs and recent story summaries provide basic deduplication; this is not semantic-deduplication accuracy.
+
+Planned: scheduled execution, editorial message/revision mutations, approval/rejection, and publishing integrations.
